@@ -1,616 +1,631 @@
 -----  access_all by zj  -----
-local remoteIp = ngx.var.remote_addr
-local headers = ngx.req.get_headers()
+local optl = require("optl")
+local ngx_var = ngx.var
+local ngx_ctx = ngx.ctx
+local ngx_unescape_uri = ngx.unescape_uri
+local config = optl.config
+local config_base = config.base or {}
+local action_tag = ""
 
-local host = ngx.unescape_uri(ngx.var.http_host)
-local referer = ngx.unescape_uri(ngx.var.http_referer)
-local agent = ngx.unescape_uri(ngx.var.http_user_agent)
+local string_find = string.find
+local string_upper = string.upper
+local type = type
+local tostring = tostring
+local table_insert = table.insert
+local ipairs = ipairs
+local pairs = pairs
+local loadstring = loadstring
+local tonumber = tonumber
+local math_min = math.min
 
-local method = ngx.unescape_uri(ngx.var.request_method)
-local url = ngx.unescape_uri(ngx.var.uri)
-local request_url = ngx.unescape_uri(ngx.var.request_uri)
-
-local base_msg = {}
-base_msg.remoteIp = remoteIp
-base_msg.host = host
-base_msg.method = method
-base_msg.request_url = request_url
-base_msg.url = url
-base_msg.agent = agent
-base_msg.referer = referer
-
-local config_dict = ngx.shared.config_dict
 local limit_ip_dict = ngx.shared.limit_ip_dict
 local ip_dict = ngx.shared.ip_dict
-local count_dict = ngx.shared.count_dict
-local token_dict = ngx.shared.token_dict
 local host_dict = ngx.shared.host_dict
 
-local cjson_safe = require "cjson.safe"
-local config_base = cjson_safe.decode(config_dict:get("base")) or {}
 
-base_msg.config_base = config_base
 
-local optl = require("optl")
+-- 经测试可直接用request_id,无重复产生 openresty >= 1.11.0.0
+local next_ctx = {request_guid = ngx_var.request_id}
+ngx_ctx.next_ctx = next_ctx
+
+-- 获取所有参数的内容
+    local remoteIp = ngx_var.remote_addr
+    local host = ngx_unescape_uri(ngx_var.http_host)
+    local ip = remoteIp
+    local method = ngx_var.request_method
+    local request_uri = ngx_unescape_uri(ngx_var.request_uri)
+    local uri = ngx_unescape_uri(ngx_var.uri)
+    local useragent = ngx_unescape_uri(ngx_var.http_user_agent)
+    local referer = ngx_unescape_uri(ngx_var.http_referer)
+    local cookie = ngx_unescape_uri(ngx_var.http_cookie)
+    local query_string = ngx_unescape_uri(ngx_var.query_string)
+
+    local headers = ngx.req.get_headers()
+    local headers_data
+    -- local function tmp_pcall()
+    --     headers_data = ngx_unescape_uri(ngx.req.raw_header(false))
+    -- end
+    -- pcall(tmp_pcall)
+    if ngx_var.server_protocol ~= "HTTP/2.0" then
+        headers_data = ngx_unescape_uri(ngx.req.raw_header(false))
+    end
+    local http_content_type = ngx_unescape_uri(ngx_var.http_content_type)
+
+    local args = ngx.req.get_uri_args()
+    local args_data = optl.get_table(args)
+
+    local posts = {}
+    local posts_data = ""
+    local posts_all
+    if method == "POST" and http_content_type then
+        -- multipart/form-data; boundary=----WebKitForm...
+        local from,to = string_find(http_content_type,"x-www-form-urlencoded",1,true)
+        if from then
+            posts = ngx.req.get_post_args()
+            posts_data = optl.get_table(posts)
+        end
+    end
+
+local base_msg = {}
+    -- string 类型http参数
+    base_msg.remoteIp = remoteIp
+    base_msg.host = host
+    base_msg.ip = ip
+    base_msg.method = method
+    base_msg.request_uri = request_uri
+    base_msg.uri = uri
+    base_msg.useragent = useragent
+    base_msg.referer = referer
+    base_msg.cookie = cookie
+    base_msg.query_string = query_string
+
+    -- table 类型参数
+    base_msg.headers = headers
+    base_msg.args = args
+    base_msg.posts = posts
+
+    -- table_str
+    base_msg.headers_data = headers_data
+    base_msg.args_data = args_data
+    base_msg.posts_data = posts_data
+
+next_ctx.base_msg = base_msg
+
+
+local host_Mod_state = host_dict:get(host)
 
 --- 2016年8月4日 增加全局Mod开关
-if config_base["Mod_state"] == "off" then
-	return
+--  增加基于host的过滤模块开关判断
+if config_base.Mod_state == "off" or host_Mod_state == "off" then
+    return
 end
 
 --- 判断config_dict中模块开关是否开启
-local function config_is_on(config_arg)
-	if config_base[config_arg] == "on" then
-		return true
-	end
+local function config_is_on(_config_arg)
+    if _config_arg == "args_Mod" then
+        return config_base[_config_arg]["state"] == "on"
+    elseif _config_arg == "post_Mod" then
+        return config_base[_config_arg]["state"] == "on"
+    else
+        return config_base[_config_arg] == "on"
+    end
 end
 
 --- 取config_dict中的json数据
-local function getDict_Config(Config_jsonName)
-	local re = cjson_safe.decode(config_dict:get(Config_jsonName)) or {}
-	return re
+local function getDict_Config(_Config_jsonName)
+    local re = config[_Config_jsonName] or {}
+    return re
+    -- return (config[_Config_jsonName] or {})
 end
 
---- remath(str,re_str,options)
---- 常用二阶匹配规则
-local remath = optl.remath
-
--- 传入 (host)
-local function loc_getRealIp(_host)
-	if config_is_on("realIpFrom_Mod") then
-		local realipfrom = getDict_Config("realIpFrom_Mod")
-		local ipfromset = realipfrom[_host]
-		if type(ipfromset) ~= "table" then return remoteIp end
-		if remath(remoteIp,ipfromset.ips[1],ipfromset.ips[2]) then
-			local x = 'http_'..ngx.re.gsub(tostring(ipfromset.realipset),'-','_')
-        	local ip = ngx.unescape_uri(ngx.var[x])
-			return ip
-		else
-			return remoteIp
-		end
-	else
-		return remoteIp
-	end
+--- remath_ext 是 remath_Invert(str,re_str,options,true) 的扩展
+local function remath_ext(str,remath_rule)
+    if type(remath_rule) ~= "table" then return false end
+    if remath_rule[2] == "rein_list" then
+        return optl.remath_Invert(string_upper(str),remath_rule[1],remath_rule[2],remath_rule[3])
+    else
+        return optl.remath_Invert(str,remath_rule[1],remath_rule[2],remath_rule[3])
+    end
 end
 
---- 匹配 host 和 url
-local function host_url_remath(_host,_url)
-	if remath(host,_host[1],_host[2]) and remath(url,_url[1],_url[2]) then
-		return true
-	end
+--- 访问频率检查 并且计数
+-- _tb_network 频率规则  _uid 唯一标识
+-- true:触发 频率限制  false:未触发 计数++
+local function network_ck(_tb_network,_uid)
+    if type(_tb_network) ~= "table" then return end
+    local pTime = _tb_network.pTime or 10
+    local maxReqs = _tb_network.maxReqs or 50
+    local ip_count = limit_ip_dict:get(_uid)
+    if ip_count == nil then
+        limit_ip_dict:set(_uid,1,pTime)
+        return
+    else
+        if ip_count >= maxReqs then
+            limit_ip_dict:delete(_uid)
+            return true
+        else
+            limit_ip_dict:incr(_uid,1)
+            return
+        end
+    end
 end
 
---- 获取单个args值
-local get_argsByName = optl.get_argsByName
+--- 匹配 host 和 uri
+local function host_uri_remath(_host,_uri)
+    if remath_ext(host,_host) and remath_ext(uri,_uri) then
+        return true
+    end
+end
 
 --- 拦截计数 2016年6月7日 21:52:52 up 从全局变成local
-local Set_count_dict = optl.set_count_dict
+local set_count_dict = optl.set_count_dict
 
--- action_deny(code) 拒绝访问
+-- 执行拦截（deny）操作
 local function action_deny()
-	if config_base.denyMsg.state == "on" then
-		local tb = getDict_Config("denyMsg")
-		local host_deny_msg = tb[host] or {}
-		local tp_denymsg = type(host_deny_msg.deny_msg)
-		if tp_denymsg == "number" then
-			ngx.exit(host_deny_msg.deny_msg)
-		elseif tp_denymsg == "string" then
-			ngx.say(host_deny_msg.deny_msg)
-			ngx.exit(200)
-		end
-	end
-	if type(config_base.denyMsg.msg) == "number" then
-		ngx.exit(config_base.denyMsg.msg)
-	else
-		ngx.say(tostring(config_base.denyMsg.msg))
-		ngx.exit(200)
-	end
+    action_tag = "deny"
+    -- 2016年9月19日
+    -- 增加Mod_state = log , host_Mod state = log
+    -- 在拒绝请求都进行了log记录，仅ip黑名单的没有记录（因为量的问题），故可直接return
+    if config_base.Mod_state == "log" or host_Mod_state == "log" then
+        return
+    end
+    local denyhtml = tostring(config_base.denyMsg.msg)
+    local denycode = config_base.denyMsg.http_code or 403
+    if config_base.denyMsg.state == "on" then
+        local tb = getDict_Config("denyMsg")
+        local host_deny_msg = tb[host] or {}
+        next_ctx.http_code = host_deny_msg.http_code or denycode
+        denyhtml = host_deny_msg.deny_msg or denyhtml
+    else
+        next_ctx.http_code = denycode
+    end
+    --ngx.header.content_type = "text/html"
+    ngx.say(denyhtml)
+    ngx.exit(200)
 end
 
-local get_postargs = optl.get_posts
-
-local post_date
-local get_date
-
---- STEP 0
-local ip = loc_getRealIp(host,headers)
-base_msg.ip = ip
-optl.debug(nil,base_msg,"---- STEP 0 ----")
-
---- STEP 0.1
--- 2016年7月29日19:14:31  检查
-if host == "" then 
-	Set_count_dict("host_method deny count")
-	optl.debug("host_method.log",base_msg,"deny")
-	ngx.exit(404)
+-- action = {allow,deny,log}
+-- 执行 动作时 的 log/计数（拦截操作） 操作
+local function do_action(_action,_mod_name,_id,_obj)
+    _id = _id or tostring(_id)
+    if _action == "allow" then
+        return true
+    elseif _action == "deny" then
+        set_count_dict(_mod_name.." deny count")
+        next_ctx.waf_log = next_ctx.waf_log or "[".._mod_name.."] deny No: ".._id
+        action_deny()
+    elseif _action == "log" then
+        set_count_dict(_mod_name.." log count")
+        next_ctx.waf_log = next_ctx.waf_log or "[".._mod_name.."] log No: ".._id
+    end
+    return false
 end
 
----  STEP 1 
--- black/white ip 访问控制(黑/白名单/log记录)
+-- 获取post_form表单数据
+local function get_post_form(_len)
+    if _len <= 0 then _len = nil end
+    posts_all = posts_all or optl.get_post_all()
+    base_msg.posts_all = posts_all
+    local parser = require "bodyparser"
+    local p, err = parser.new(posts_all, http_content_type,_len)
+    if p then
+        local tmp_tb = {}
+        while true do
+           local part_body, name, mime, filename = p:parse_part()
+           if not part_body then
+              break
+           end
+           table_insert(tmp_tb, {name,filename,mime,part_body})
+        end
+        base_msg.post_form = tmp_tb
+    end
+end
+
+---  SETP 0
+-- 获取用户真实IP（如有CDN情况下，从header头取）
+if config_is_on("realIpFrom_Mod") then
+    ip = optl.loc_getRealIp(remoteIp,getDict_Config("realIpFrom_Mod")[host])
+    base_msg.ip = ip
+end
+
+---  STEP 1
+-- black/white ip 访问控制(黑/白名单/log记录) [ip类拦截数据太多未写日志，可自行取消next_ctx.waf_log赋值的注释]
 -- 2016年7月29日19:12:53 检查
 if config_is_on("ip_Mod") then
-	local _ip_v = ip_dict:get(ip) --- 全局IP 黑白名单
-	if _ip_v ~= nil then
-		if _ip_v == "allow" then -- 跳出后续规则
-			return
-		elseif _ip_v == "log" then 
-			Set_count_dict("ip log count")
-	 		optl.debug("ip.log",base_msg,"log")
-		else
-			Set_count_dict(ip)
-			action_deny()
-		end
-	end
-	local host_ip = ip_dict:get(host.."-"..ip)
-	if host_ip ~= nil then
-		if host_ip == "allow" then -- 跳出后续规则
-			return
-		elseif host_ip == "log" then 
-			Set_count_dict(host.."-ip log count")
-	 		optl.debug(host..".log",base_msg,"log")
-		else
-			Set_count_dict(host.."-"..ip)
-			action_deny()
-		end
-	end
+    local _ip_v = ip_dict:get(ip) --- 全局IP 黑白名单
+    if _ip_v == nil then
+        -- nothing
+    elseif _ip_v == "allow" then -- 跳出后续规则
+        return
+    elseif _ip_v == "log" then
+        set_count_dict(ip.." log count")
+         --next_ctx.waf_log = "[ip_Mod] log"
+    else
+        --next_ctx.waf_log = "[ip_Mod] deny"
+        set_count_dict(ip)
+        action_deny()
+    end
+    -- 基于host的ip黑白名单 eg:www.abc.com_101.111.112.113
+    local tmp_host_ip = host.."_"..ip
+    local host_ip = ip_dict:get(tmp_host_ip)
+    if host_ip == nil then
+        -- nothing
+    elseif host_ip == "allow" then -- 跳出后续规则
+        return
+    elseif host_ip == "log" then
+        set_count_dict(tmp_host_ip.." log count")
+         --next_ctx.waf_log = "[host_ip_Mod] log"
+    else
+        --next_ctx.waf_log = "[host_ip_Mod] deny"
+        set_count_dict(tmp_host_ip)
+        action_deny()
+    end
+    -- 基于 业务属性 进行拦截
+    local host_guid_name = host_dict:get(host.."_guid")
+    if host_guid_name then
+        -- 基于业务属性 拦截
+        -- 获取当前请求的业务属性 ngx.var[%guid%]
+        -- %host%..ngx.var[%guid_name%]
+        local tmp_gd = ngx_var[host_guid_name]
+        if tmp_gd then
+            local ip_dict_get_guid = ip_dict:get(host.."_"..tmp_gd)
+            if ip_dict_get_guid then
+                -- next_ctx.waf_log = "[ip_Mod：业务属性] deny"
+                action_deny()
+            end
+        end
+    end
 end
 
 ---  STEP 2
--- host and method  访问控制(白名单)
-
-if config_is_on("host_method_Mod") then
-	local tb_mod = getDict_Config("host_method_Mod")
-	local check
-	for i,v in ipairs(tb_mod) do
-		if v.state == "on" then			
-			if remath(host,v.hostname[1],v.hostname[2]) and remath(method,v.method[1],v.method[2]) then
-				check = "allow"
-				break
-			end
-		end
-	end
-	if check ~= "allow" then
-		Set_count_dict("host_method deny count")
-	 	optl.debug("host_method.log",base_msg,"deny")
-	 	action_deny()
-	end
+-- host and method  仅允许 访问控制
+if config_is_on("host_method_Mod") and action_tag == "" then
+    local tb_mod = getDict_Config("host_method_Mod")
+    local check = "deny"
+    for _,v in ipairs(tb_mod) do
+        if v.state == "on" and remath_ext(host,v.hostname) and remath_ext(method,v.method) then
+            check = "next"
+            break
+        end
+    end
+    if check == "deny" then
+        set_count_dict("host_method_Mod deny count")
+         next_ctx.waf_log = next_ctx.waf_log or "[host_method_Mod] deny"
+         action_deny()
+    end
 end
---debug("----------- STEP 2")
 
 --- STEP 3
--- rewrite 跳转阶段(set-cookie)
+-- rewrite 跳转阶段(set_cookie)
 -- 本来想着放到rewrite阶段使用的，方便统一都放到access阶段了。
-if config_is_on("rewrite_Mod") then
-	local tb_mod = getDict_Config("rewrite_Mod")
-	for i,v in ipairs(tb_mod) do
-		if v.state == "on" then
-			if host_url_remath(v.hostname,v.url) then
-				if v.action[1] == "set-cookie" then
-					local token = ngx.md5(v.action[2] .. ip)
-		            if (ngx.var.cookie_token ~= token) then
-		                ngx.header["Set-Cookie"] = {"token=" .. token}
-		                if method == "POST" then
-		                	return ngx.redirect(ngx.var.request_uri,307)
-		                else
-		                	return ngx.redirect(ngx.var.request_uri)
-		                end
-		            end
-				elseif v.action[1] == "set-url" then
-				-- 备用 使用url尾巴跳转方式进行验证
-					
-				end
-			end
-		end
-	end
-end
+if config_is_on("rewrite_Mod") and action_tag == "" then
+    local tb_mod = getDict_Config("rewrite_Mod")
+    for _,v in ipairs(tb_mod) do
+        if v.state == "on" and host_uri_remath(v.hostname,v.uri) then
 
+            if v.action == "set_cookie" then
+                local token = ngx.md5(v.set_cookie[1] .. ip)
+                local token_name = v.set_cookie[2] or "token"
+                -- 没有设置 tokenname 默认就是 token
+                if ngx_var["cookie_"..token_name] ~= token then
+                    ngx.header["Set-Cookie"] = {token_name.."=" .. token}
+                    if method == "POST" then
+                        return ngx.redirect(request_uri,307)
+                    else
+                        return ngx.redirect(request_uri)
+                    end
+                end
+            elseif v.action == "set_url" then
+            -- 备用 使用url尾巴跳转方式进行验证
+
+            end
+
+        end
+    end
+end
 
 --- STEP 4
 -- host_Mod 规则过滤
-if host_dict:get(host) == "on" then
-	local tb = cjson_safe.decode(host_dict:get(host.."_HostMod")) or {}
-	local _action,no
-	for i,v in ipairs(tb) do
-		no = i
-		if v.action[2] == "url" then
-			if remath(url,v.url[1],v.url[2]) then
-				_action = v.action[1]
-				break
-			end
-		elseif v.action[2] == "referer" then
-			if remath(referer,v.referer[1],v.referer[2]) and remath(url,v.url[1],v.url[2])  then
-				_action = v.action[1]
-				break
-			end
-		elseif v.action[2] == "useragent" then
-			if remath(agent,v.useragent[1],v.useragent[2]) then				
-				_action = v.action[1]
-				break
-			end
-		elseif v.action[2] == "network" then
-			if remath(url,v.url[1],v.url[2]) then
-				local mod_host_ip = ip.." host_network_Mod No "..i
-				local ip_count = limit_ip_dict:get(mod_host_ip)
-				if ip_count == nil then
-					local pTime =  v.network.pTime or 10
-					limit_ip_dict:set(mod_host_ip,1,pTime)
-				else
-					local maxReqs = v.network.maxReqs or 50
-					if ip_count >= maxReqs then
-						--debug("maxReqs is true")
-						local blacktime = v.network.blackTime or 10*60
-						ip_dict:safe_set(host.."-"..ip,mod_host_ip,blacktime)
-						optl.debug(host..".log",base_msg,"network_Mod  deny No : "..i)
-						_action = v.action[1]
-						break
-					else
-					    limit_ip_dict:incr(mod_host_ip,1)
-					end
-				end
-			end
-		end
-	end
-
-	if _action == "deny" then
-		Set_count_dict(host.." deny count")
-		optl.debug(host..".log",base_msg,"deny No: "..no)
-		action_deny()
-	elseif _action == "log" then
-		Set_count_dict(host.." log count")
-		optl.debug(host..".log",base_msg,"log No: "..no)
-	elseif _action == "allow" then
-		return
-	end
+-- 动作支持 （allow deny log）
+if  host_Mod_state == "on" and action_tag == "" then
+    -- 后续 可能缓存起来，不用每次都进行 序列化操作
+    local tb = optl.stringTojson(host_dict:get(host.."_HostMod"))
+    for i,v in ipairs(tb) do
+        if v.state == "on" and remath_ext(uri,v.uri) then
+            if v.app_ext then
+                if type(v.post_form) == "number" and method == "POST" and base_msg.post_form == nil then
+                    local post_form_n = v.post_form
+                    local base_post_from_n = tonumber(config_base.post_form) or 0
+                    post_form_n = math_min(post_form_n,base_post_from_n)
+                    get_post_form(post_form_n)
+                end
+                if optl.re_app_ext(v.app_ext,base_msg) then
+                    if do_action(v.action,"host_Mod",i) then
+                        return
+                    else
+                        break
+                    end
+                end
+            elseif v.network then
+                local blacktime = v.network["blacktime"] or 600
+                if v.network.guid and ngx_var[v.network.guid] then
+                    -- 业务属性 计数
+                    local guid_value = ngx_var[v.network.guid]
+                    local mod_host_guid = host..guid_value.." host_network No "..i
+                    if network_ck(v.network,mod_host_guid) then
+                        host_dict:safe_set(host.."_guid",v.network.guid,blacktime)
+                        ip_dict:safe_set(host.."_"..guid_value,mod_host_guid,blacktime)
+                        next_ctx.waf_log = next_ctx.waf_log or "[host_Mod] deny No: "..i
+                        -- network 触发直接拦截
+                        set_count_dict(host.." deny count")
+                        action_deny()
+                        break
+                    end
+                else
+                    -- ip 计数
+                    local mod_host_ip = host.."_"..ip.." host_network No "..i
+                    if network_ck(v.network,mod_host_ip) then
+                        ip_dict:safe_set(host.."_"..ip,mod_host_ip,blacktime)
+                        next_ctx.waf_log = next_ctx.waf_log or "[host_Mod] deny No: "..i
+                        -- network 触发直接拦截
+                        set_count_dict(host.." deny count")
+                        action_deny()
+                        break
+                    end
+                end
+            end
+        end
+    end
 end
 
 -- --- STEP 5
 -- -- app_Mod 访问控制 （自定义action）
--- -- 目前支持的 deny allow log rehtml refile relua
-if config_is_on("app_Mod") then
-	local app_mod = getDict_Config("app_Mod")
-	for i,v in ipairs(app_mod) do
-		if v.state == "on" then
-			--debug("app_Mod state is on "..i)
-			if host_url_remath(v.hostname,v.url) then
-				
-				if v.action[1] == "deny" then
-					Set_count_dict("app deny count")
-					--debug("app_Mod deny No : "..i,"app_log",ip)
-					optl.debug("app.log",base_msg,"deny No : "..i)
-					action_deny()
-					break
+-- -- 目前支持的 deny allow log rehtml refile relua relua_str
+-- 支持 规则组 取反 or/and 连接符
+if config_is_on("app_Mod") and action_tag == "" then
+    local app_mod = getDict_Config("app_Mod")
+    for i,v in ipairs(app_mod) do
+        if v.state == "on" and host_uri_remath(v.hostname,v.uri) then
+            if type(v.post_form) == "number" and method == "POST" and base_msg.post_form == nil then
+                local post_form_n = v.post_form
+                local base_post_from_n = tonumber(config_base.post_form) or 0
+                post_form_n = math_min(post_form_n,base_post_from_n)
+                get_post_form(post_form_n)
+            end
+            if v.app_ext == nil or optl.re_app_ext(v.app_ext,base_msg) then
 
-				elseif v.action[1] == "allow" then
+                if v.action[1] == "deny" then
 
-					return
+                    set_count_dict("app deny count")
+                    next_ctx.waf_log = next_ctx.waf_log or "[app_Mod] deny No: "..i
+                    action_deny()
+                    break
 
-				elseif v.action[1] == "next" then
-					--debug("app_Mod action = allow")
-					local check
-					if v.action[2] == "args" then
-						local get_args = get_argsByName(v.args[3])
-						--debug("get_args by keyby : "..get_args.."")
-						if remath(get_args,v.args[1],v.args[2]) then
-							check = "next"
-						end
-				
-					elseif v.action[2] == "ip" then -- 增加IP判断（eg:对某url[目录进行IP控制]）
-						if remath(ip,v.ip[1],v.ip[2]) then
-							check = "next"
-						end
-					else
-						check = "next"
-					end
+                elseif v.action[1] == "allow" then
 
-					if check == "next" then
-						--return
-					else
-						Set_count_dict("app deny count")
-						--debug("app_Mod deny No : "..i,"app_log",ip)
-						optl.debug("app.log",base_msg,"deny No : "..i)
-						action_deny()
-						break
-					end					
+                    return
 
-				elseif v.action[1] == "log" then
-					local http_tmp = {}
-					http_tmp["headers"] = headers
-					get_date = ngx.unescape_uri(ngx.var.query_string)
-					http_tmp["get_date"] = get_date
-					if method == "POST" then
-						post_date = get_postargs()
-						http_tmp["post"] = post_date						
-					end
-					--debug("app_Mod log Msg : "..tableTojson(http_tmp),"app_log",ip)
-					optl.debug("app.log",base_msg,"log Msg : "..optl.tableTojson(http_tmp))
-				elseif v.action[1] == "rehtml" then
-					optl.sayHtml_ext(v.rehtml)
-					break
+                elseif v.action[1] == "log" then
+                    if method == "POST" then
+                        posts_all = posts_all or optl.get_post_all()
+                        base_msg.posts_all = posts_all
+                    end
+                    optl.writefile(config_base.logPath.."app.log","log Msg : \n"..optl.tableTojson(base_msg))
+                    -- app_Mod的action=log单独记录，用于debug调试
 
-				elseif v.action[1] == "refile" then
-					optl.sayFile(config_base.htmlPath..v.refile)
-					break
+                elseif v.action[1] == "rehtml" then
+                    optl.sayHtml_ext(v.rehtml,true)
+                    break
 
-				elseif v.action[1] == "relua" then
-					local re_saylua = optl.sayLua(config_base.htmlPath..v.relua)
-					--ngx.say(config_base.htmlPath..v.relua)
-					if re_saylua == "break" then
-						ngx.exit(200)
-						break
-					end
+                elseif v.action[1] == "refile" then
+                    optl.sayFile(config_base.htmlPath..v.refile[1],v.refile[2])
+                    break
 
-				elseif v.action[1] == "set" then -- 预留
-					break
-				else
-					break
-				end 
-			end
-		end
-	end
+                -- 2016年10月27日 新增 动态执行lua字符串
+                elseif v.action[1] == "relua_str" then
+                    local re_lua_do = loadstring(v.relua_str)
+                    if re_lua_do() == "break" then
+                        ngx.exit(200)
+                    end
+
+                elseif v.action[1] == "relua" then
+                    local re_saylua = optl.sayLua(config_base.htmlPath..v.relua)
+                    if re_saylua == "break" then
+                        ngx.exit(200)
+                    end
+
+                elseif v.action[1] == "set" then -- 预留
+
+                end
+            end
+
+        end
+    end
 end
 
 -- --- STEP 6
--- -- referer (白名单/log记录/next)
-if config_is_on("referer_Mod") then
-	local check,no
-	local ref_mod = getDict_Config("referer_Mod")
-	for i, v in ipairs( ref_mod ) do
-		if v.state == "on" then
-			no = i
-			if host_url_remath(v.hostname,v.url) then
-				if v.action == "allow" then
-					if remath(referer,v.referer[1],v.referer[2]) then
-						check = "allow"
-						break					
-					else
-						check = "deny"
-						break
-					end
-				elseif v.action == "next" then
-					if remath(referer,v.referer[1],v.referer[2]) then
-						check = "next"
-						break
-					else
-						check = "deny"
-						break
-					end
-				elseif v.action == "log" then
-					if remath(referer,v.referer[1],v.referer[2]) then
-						check = "log"
-						break
-					end
-				else
-					if remath(referer,v.referer[1],v.referer[2]) then
-						check = "deny"
-						break
-					end
-				end
-			end
-		end
-	end
-	if check == "allow" then --- 直接跳出后续规则检查
-		return
-	elseif check == "next" then
-		-- nil
-	elseif check == "log" then
-		Set_count_dict("referer_deny count")
-		optl.debug("referer.log",base_msg,"log  No : "..no)
-	elseif check == "deny" then
-		Set_count_dict("referer_deny count")
-		optl.debug("referer.log",base_msg,"deny  No : "..no)
-		action_deny()
-	else
-		
-	end
+-- -- referer过滤模块
+--  动作支持（allow deny log）
+if config_is_on("referer_Mod") and action_tag == "" then
+    local ref_mod = getDict_Config("referer_Mod")
+    for i, v in ipairs( ref_mod ) do
+        if v.state == "on" and host_uri_remath(v.hostname,v.uri) and remath_ext(referer,v.referer) then
+            local _action = v.action or "deny"
+            if do_action(_action,"uri_Mod",i) then
+                return
+            else
+                break
+            end
+        end
+    end
 end
 
 --- STEP 7
--- url 过滤(黑/白名单)
-if config_is_on("url_Mod") then
-	local url_mod = getDict_Config("url_Mod")
-	local t,no
-	for i, v in ipairs( url_mod ) do
-		no = i
-		if v.state == "on" then
-			if host_url_remath(v.hostname,v.url) then
-				t = v.action
-				break
-			end
-		end
-	end
-	if t == "allow" then --- 跳出后续规则
-		return
-	elseif t ==	"deny" then
-		Set_count_dict("url deny count")
-		optl.debug("url.log",base_msg,"deny No : "..no)
-		action_deny()
-	elseif t == "log" then
-		Set_count_dict("url log count")
-		optl.debug("url.log",base_msg,"log No : "..no)
-	end
+-- uri 过滤(黑/白名单/log)
+if config_is_on("uri_Mod") and action_tag == "" then
+    local uri_mod = getDict_Config("uri_Mod")
+    for i, v in ipairs( uri_mod ) do
+        if v.state == "on" and host_uri_remath(v.hostname,v.uri) then
+            local _action = v.action or "deny"
+            if do_action(_action,"uri_Mod",i) then
+                return
+            else
+                break
+            end
+        end
+    end
 end
 
 --- STEP 8
 -- header 过滤(黑名单) [scanner]
-if config_is_on("header_Mod") then
-	local tb_mod = getDict_Config("header_Mod")
-	for i,v in ipairs(tb_mod) do
-		if v.state == "on" then			
-			if host_url_remath(v.hostname,v.url) then
-				if remath(headers[v.header[1]],v.header[2],v.header[3]) then
-					Set_count_dict("header_method deny count")
-				 	optl.debug("header.log",base_msg,"deny No : "..i)
-				 	action_deny()
-				end
-			end
-		end
-	end
+if config_is_on("header_Mod") and action_tag == "" then
+    local tb_mod = getDict_Config("header_Mod")
+    for i,v in ipairs(tb_mod) do
+        if v.state == "on" and host_uri_remath(v.hostname,v.uri) then
+            if optl.action_remath("headers",v.header,base_msg) then
+                set_count_dict("header deny count")
+                 next_ctx.waf_log = next_ctx.waf_log or "[header_Mod] deny No: "..i
+                 action_deny()
+                 break
+            end
+        end
+    end
 end
 
 --- STEP 9
 -- useragent(黑、白名单/log记录)
-if config_is_on("useragent_Mod") then	
-	local uagent_mod = getDict_Config("useragent_Mod")
-	for i, v in ipairs( uagent_mod ) do
-		if v.state == "on" then
-			--debug(i.." agent_Mod state is on")
-			if remath(host,v.hostname[1],v.hostname[2]) then
-				--debug("useragent host is ok")
-				if remath(agent,v.useragent[1],v.useragent[2]) then
-					if v.action == "allow" then
-						return
-					elseif v.action == "log" then
-						Set_count_dict("agent deny count")
-						optl.debug("agent.log",base_msg,"log No : "..i)
-						break
-					else
-						Set_count_dict("agent deny count")
-						optl.debug("agent.log",base_msg,"deny No : "..i)
-						action_deny()
-						break
-					end
-				end
-			end
-		end
-	end
+if config_is_on("useragent_Mod") and action_tag == "" then
+    local uagent_mod = getDict_Config("useragent_Mod")
+    for i, v in ipairs( uagent_mod ) do
+        if v.state == "on" and remath_ext(host,v.hostname) and remath_ext(useragent,v.useragent) then
+            local _action = v.action or "deny"
+            if do_action(_action,"useragent_Mod",i) then
+                return
+            else
+                break
+            end
+        end
+    end
 end
 
 --- STEP 10
 -- cookie (黑/白名单/log记录)
-local cookie = ngx.var.http_cookie
-
-if config_is_on("cookie_Mod") and cookie ~= nil then
-	cookie = ngx.unescape_uri(cookie)
-	local cookie_mod = getDict_Config("cookie_Mod")
-	for i, v in ipairs( cookie_mod ) do
-		if v.state == "on" then
-			if remath(host,v.hostname[1],v.hostname[2]) then
-				if remath(cookie,v.cookie[1],v.cookie[2]) then
-					if v.action == "deny" then
-						Set_count_dict("cookie deny count")
-						optl.debug("cookie.log",base_msg,"deny _cookie : "..cookie.." No : "..i)
-						action_deny()
-						break
-					elseif v.action =="log" then
-						Set_count_dict("cookie log count")
-						optl.debug("cookie.log",base_msg,"log _cookie : "..cookie.." No : "..i)
-						break
-					elseif v.action == "allow" then
-						return
-					end
-				end
-			end
-		end
-	end
+if config_is_on("cookie_Mod") and action_tag == "" then
+    local cookie_mod = getDict_Config("cookie_Mod")
+    for i, v in ipairs( cookie_mod ) do
+        if v.state == "on" and remath_ext(host,v.hostname) and remath_ext(cookie,v.cookie) then
+            local _action = v.action or "deny"
+            if do_action(_action,"cookie_Mod",i) then
+                return
+            else
+                break
+            end
+        end
+    end
 end
 
 --- STEP 11
--- args (黑/白名单/log记录)
-if config_is_on("args_Mod") then
-	--debug("args_Mod is on")
-	local args_mod = getDict_Config("args_Mod")
-	local args = get_date or ngx.unescape_uri(ngx.var.query_string)
-	if args ~= "" then
-		for i,v in ipairs(args_mod) do
-			if v.state == "on" then
-				--debug("args_Mod state is on "..i)
-				if remath(host,v.hostname[1],v.hostname[2]) then			
-					if remath(args,v.args[1],v.args[2]) then
-						if v.action == "deny" then
-							Set_count_dict("args deny count")
-							optl.debug("args.log",base_msg,"deny _args = "..args.." No : "..i)
-							action_deny()
-							break
-						elseif v.action == "log" then
-							Set_count_dict("args log count")
-							optl.debug("args.log",base_msg,"log _args = "..args.." No : "..i)
-							break
-						elseif v.action == "allow" then
-							return							
-						end
-					end
-				end
-			end
-		end
-	end
+-- args [args_data] (黑/白名单/log记录)
+if config_is_on("args_Mod") and action_tag == "" then
+    if config_base.args_Mod["HPP_state"] == "on" then
+        for k,v in pairs(args) do
+            if type(v) == "table" then
+                do_action("deny","args_HPP","0")
+                break
+            end
+        end
+    end
+    if action_tag == "" then
+        local args_mod = getDict_Config("args_Mod")
+        for i,v in ipairs(args_mod) do
+            if v.state == "on" and remath_ext(host,v.hostname) and remath_ext(args_data,v.args_data) then
+                local _action = v.action or "deny"
+                if do_action(_action,"args_Mod",i) then
+                    return
+                else
+                    break
+                end
+            end
+        end
+    end
 end
 
 --- STEP 12
 -- post (黑/白名单)
-
-if config_is_on("post_Mod") and method == "POST" then
-	--debug("post_Mod is on")
-	local post_mod = getDict_Config("post_Mod")
-	local postargs = post_date or get_postargs()
-	if postargs ~= "" then
-		for i,v in ipairs(post_mod) do
-			if v.state == "on" then
-				--debug(i.." post_mod state is on")
-				if remath(host,v.hostname[1],v.hostname[2]) then
-					if remath(postargs,v.post[1],v.post[2]) then
-						if v.action == "deny" then
-							Set_count_dict("post deny count")
-							optl.debug("post.log",base_msg,"deny _post : "..postargs.."No : "..i)
-							action_deny()
-							break
-						elseif v.action == "log" then
-							Set_count_dict("post log count")
-							optl.debug("post.log",base_msg,"deny _post : "..postargs.."No : "..i)
-							break
-						elseif v.action == "allow" then
-							return
-						end
-					end
-				end
-			end
-		end
-	end
+if config_is_on("post_Mod") and action_tag == "" and method == "POST" then
+    if config_base.post_Mod["HPP_state"] == "on" then
+        for k,v in pairs(posts) do
+            if type(v) == "table" then
+                do_action("deny","posts_HPP","0")
+                break
+            end
+        end
+    end
+    if action_tag == "" then
+        local post_mod = getDict_Config("post_Mod")
+        for i,v in ipairs(post_mod) do
+            if v.state == "on" and remath_ext(host,v.hostname) and remath_ext(posts_data,v.posts_data) then
+                local _action = v.action or "deny"
+                if do_action(_action,"post_Mod",i) then
+                    return
+                else
+                    break
+                end
+            end
+        end
+    end
 end
-
 
 --- STEP 13
 -- network_Mod 访问控制
-if config_is_on("network_Mod") then
-	local tb_networkMod = getDict_Config("network_Mod")
-	for i, v in ipairs( tb_networkMod ) do
-		if v.state =="on" then
-			if host_url_remath(v.hostname,v.url) then
-				local mod_ip = ip.." network_Mod No "..i
-				local ip_count = limit_ip_dict:get(mod_ip)
-				if ip_count == nil then
-					local pTime =  v.network.pTime or 10
-					limit_ip_dict:set(mod_ip,1,pTime)
-				else
-					local maxReqs = v.network.maxReqs or 50
-					if ip_count >= maxReqs then
-						local blacktime = v.network.blackTime or 10*60
-						if v.hostname[2] == "" then
-							if v.hostname[1] == "*" then
-								ip_dict:safe_set(ip,mod_ip,blacktime)
-							else
-								ip_dict:safe_set(host.."-"..ip,mod_ip,blacktime)
-							end
-						elseif v.hostname[2] == "table" then
-							for j,vj in ipairs(v.hostname[1]) do
-								ip_dict:safe_set(vj.."-"..ip,mod_ip,blacktime)
-							end
-						elseif v.hostname[2] == "list" then
-							for j,vj in pairs(v.hostname[1]) do
-								ip_dict:safe_set(j.."-"..ip,mod_ip,blacktime)
-							end
-						else
-							ip_dict:safe_set(host.."-"..ip,mod_ip,blacktime)
-						end
-						optl.debug("network.log",base_msg,"deny  No : "..i)
-						action_deny()
-						--ngx.say("frist network deny")
-						break
-					else
-					    limit_ip_dict:incr(mod_ip,1)
-					end
-				end
-			end
-		end
-	end
+if config_is_on("network_Mod") and action_tag == "" then
+    local tb_networkMod = getDict_Config("network_Mod")
+    for i, v in ipairs( tb_networkMod ) do
+        if v.state =="on" and host_uri_remath(v.hostname,v.uri) then
+            local blacktime = v.network.blackTime or 10*60
+            -- 业务属性 计数
+            if v.network.guid and ngx_var[v.network.guid] then
+                local guid_value = ngx_var[v.network.guid]
+                local mod_host_guid = host..guid_value.." network_Mod No "..i
+                if network_ck(v.network,mod_host_guid) then
+                    host_dict:safe_set(host.."_guid",v.network.guid,blacktime)
+                    ip_dict:safe_set(host.."_"..guid_value,mod_host_guid,blacktime)
+                    next_ctx.waf_log = next_ctx.waf_log or "[network_Mod] deny No: "..i
+                    action_deny()
+                    break
+                end
+            else
+                -- ip 属性 计数
+                local deny_guid = ip.." network_Mod No "..i
+                if network_ck(v.network,deny_guid) then
+                    if v.hostname[2] == "" then
+                        if v.hostname[1] == "*" then
+                            ip_dict:safe_set(ip,deny_guid,blacktime)
+                        else
+                            ip_dict:safe_set(host.."_"..ip,deny_guid,blacktime)
+                        end
+                    else
+                        ip_dict:safe_set(host.."_"..ip,deny_guid,blacktime)
+                    end
+                    next_ctx.waf_log = next_ctx.waf_log or "[network_Mod] deny  No: "..i
+                    action_deny()
+                    --ngx.say("frist network deny")
+                    break
+                end
+            end
+        end
+    end
 end
 
+--- STEP 14
+if config_is_on("replace_Mod") and action_tag == "" then
+    local Replace_Mod = getDict_Config("replace_Mod")
+    for _,v in ipairs(Replace_Mod) do
+        if v.state =="on" and host_uri_remath(v.hostname,v.uri) then
+            ngx.req.clear_header("Accept-Encoding")-- 取消浏览器要求gzip操作)
+            next_ctx.replace_Mod = v
+            --ngx_ctx.body_mod = v
+            break
+        end
+    end
+end
